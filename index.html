@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <!-- Meta tag ini sangat penting untuk pengalaman mobile yang baik -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Kanvas Piksel Mobile</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            /* Mencegah scroll, bounce, dan highlight pada mobile */
+            overflow: hidden;
+            position: fixed;
+            width: 100%;
+            height: 100%;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            touch-action: none; /* Menonaktifkan aksi sentuh default browser */
+        }
+        canvas {
+            display: block;
+            background-color: #f0f0f0;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white">
+
+    <div id="app-container" class="w-screen h-screen relative">
+        <canvas id="pixelCanvas"></canvas>
+
+        <!-- Panel Kontrol -->
+        <div class="absolute bottom-4 left-1/2 -translate-x-1/2 bg-gray-800/80 backdrop-blur-sm p-3 rounded-xl shadow-2xl flex items-center gap-3 border border-gray-700">
+            <input type="color" id="colorPicker" value="#FFFFFF" class="w-12 h-12 bg-transparent border-2 border-gray-600 rounded-md cursor-pointer">
+            <div id="color-palette" class="flex gap-2.5">
+                <!-- Palet warna akan ditambahkan oleh JS -->
+            </div>
+        </div>
+
+        <!-- Panel Informasi & Bantuan -->
+        <div class="absolute top-4 left-4 bg-gray-800/80 backdrop-blur-sm p-4 rounded-xl shadow-2xl border border-gray-700 max-w-[250px]">
+            <h1 class="text-base font-bold text-white mb-2">Kanvas Piksel Mobile</h1>
+            <div class="mt-2 text-xs text-gray-300 space-y-1.5">
+                <p><span class="font-semibold">Ketuk/Geser:</span> Gambar Piksel</p>
+                <p><span class="font-semibold">Dua Jari:</span> Geser & Zoom Kanvas</p>
+            </div>
+             <div id="loading-indicator" class="mt-3 text-xs text-yellow-400 flex items-center gap-2">
+                <svg class="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <span>Menyambung...</span>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Konfigurasi dan Inisialisasi Firebase ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-pixel-canvas-mobile';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { apiKey: "DEMO", authDomain: "DEMO", projectId: "DEMO" };
+        
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const auth = getAuth(app);
+        
+        const PIXEL_COLLECTION = `/artifacts/${appId}/public/data/pixels`;
+
+        // --- Variabel Global & State Aplikasi ---
+        const canvas = document.getElementById('pixelCanvas');
+        const ctx = canvas.getContext('2d');
+        const colorPicker = document.getElementById('colorPicker');
+        const loadingIndicator = document.getElementById('loading-indicator');
+
+        const GRID_SIZE = 16; // Ukuran piksel sedikit lebih besar untuk mobile
+        let pixels = {};
+        let currentColor = colorPicker.value;
+
+        // State untuk Pan & Zoom
+        let panOffset = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+        let scale = 1.0;
+        const MAX_SCALE = 30;
+        const MIN_SCALE = 0.05;
+        
+        // State untuk kontrol sentuh
+        let isGesturing = false;
+        let initialPinchDistance = 0;
+        let lastPanMidpoint = { x: 0, y: 0 };
+        let lastDrawnPixel = {x: null, y: null};
+
+
+        // --- Fungsi Utama ---
+
+        function setupCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            ctx.imageSmoothingEnabled = false;
+        }
+
+        function draw() {
+            ctx.fillStyle = '#111827';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            ctx.save();
+            ctx.translate(panOffset.x, panOffset.y);
+            ctx.scale(scale, scale);
+
+            for (const key in pixels) {
+                const p = pixels[key];
+                ctx.fillStyle = p.color;
+                ctx.fillRect(p.x * GRID_SIZE, p.y * GRID_SIZE, GRID_SIZE, GRID_SIZE);
+            }
+            
+            if (scale > 5) {
+                drawGrid();
+            }
+
+            ctx.restore();
+        }
+        
+        function drawGrid() {
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+            ctx.lineWidth = 1 / scale;
+
+            const view = getVisibleWorldRect();
+            const startX = Math.floor(view.x / GRID_SIZE) * GRID_SIZE;
+            const startY = Math.floor(view.y / GRID_SIZE) * GRID_SIZE;
+            const endX = Math.ceil((view.x + view.width) / GRID_SIZE) * GRID_SIZE;
+            const endY = Math.ceil((view.y + view.height) / GRID_SIZE) * GRID_SIZE;
+            
+            for (let x = startX; x <= endX; x += GRID_SIZE) {
+                ctx.beginPath();
+                ctx.moveTo(x, startY);
+                ctx.lineTo(x, endY);
+                ctx.stroke();
+            }
+            for (let y = startY; y <= endY; y += GRID_SIZE) {
+                ctx.beginPath();
+                ctx.moveTo(startX, y);
+                ctx.lineTo(endX, y);
+                ctx.stroke();
+            }
+        }
+        
+        function screenToWorld(x, y) {
+            return {
+                x: (x - panOffset.x) / scale,
+                y: (y - panOffset.y) / scale
+            };
+        }
+
+        function getVisibleWorldRect() {
+            return {
+                x: -panOffset.x / scale,
+                y: -panOffset.y / scale,
+                width: canvas.width / scale,
+                height: canvas.height / scale
+            };
+        }
+        
+        async function placePixel(gridX, gridY, color) {
+            // Hanya gambar jika koordinatnya berbeda dari piksel terakhir
+            if (gridX === lastDrawnPixel.x && gridY === lastDrawnPixel.y) return;
+
+            lastDrawnPixel = {x: gridX, y: gridY};
+            const pixelId = `${gridX}_${gridY}`;
+            try {
+                await setDoc(doc(db, PIXEL_COLLECTION, pixelId), { x: gridX, y: gridY, color: color });
+            } catch (error) {
+                console.error("Gagal menyimpan piksel:", error);
+            }
+        }
+
+        function setupPalette() {
+            const paletteContainer = document.getElementById('color-palette');
+            const colors = ['#FFFFFF', '#000000', '#FF453A', '#FFD60A', '#32D74B', '#0A84FF'];
+            
+            colors.forEach(color => {
+                const swatch = document.createElement('button');
+                swatch.className = 'w-10 h-10 rounded-lg border-2 border-gray-600 active:border-blue-400 transition-all duration-150';
+                swatch.style.backgroundColor = color;
+                swatch.addEventListener('click', () => {
+                    currentColor = color;
+                    colorPicker.value = color;
+                });
+                paletteContainer.appendChild(swatch);
+            });
+        }
+
+        // --- Event Listeners untuk Mobile ---
+        
+        function handleTouchStart(e) {
+            if (e.touches.length === 1) { // Satu jari untuk menggambar
+                const touch = e.touches[0];
+                const worldPos = screenToWorld(touch.clientX, touch.clientY);
+                const gridX = Math.floor(worldPos.x / GRID_SIZE);
+                const gridY = Math.floor(worldPos.y / GRID_SIZE);
+                placePixel(gridX, gridY, currentColor);
+            } else if (e.touches.length === 2) { // Dua jari untuk gestur
+                e.preventDefault();
+                isGesturing = true;
+                initialPinchDistance = getPinchDistance(e.touches);
+                lastPanMidpoint = getMidpoint(e.touches);
+            }
+        }
+        
+        function handleTouchMove(e) {
+            if (e.touches.length === 1 && !isGesturing) { // Menggambar saat digeser
+                const touch = e.touches[0];
+                const worldPos = screenToWorld(touch.clientX, touch.clientY);
+                const gridX = Math.floor(worldPos.x / GRID_SIZE);
+                const gridY = Math.floor(worldPos.y / GRID_SIZE);
+                placePixel(gridX, gridY, currentColor);
+            } else if (e.touches.length === 2 && isGesturing) { // Pan & Zoom
+                e.preventDefault();
+
+                // Zoom
+                const newPinchDistance = getPinchDistance(e.touches);
+                const zoomFactor = newPinchDistance / initialPinchDistance;
+                let newScale = scale * zoomFactor;
+                if (newScale > MAX_SCALE) newScale = MAX_SCALE;
+                if (newScale < MIN_SCALE) newScale = MIN_SCALE;
+
+                // Pan
+                const newMidpoint = getMidpoint(e.touches);
+                const panDeltaX = newMidpoint.x - lastPanMidpoint.x;
+                const panDeltaY = newMidpoint.y - lastPanMidpoint.y;
+
+                // Terapkan perubahan
+                panOffset.x += panDeltaX;
+                panOffset.y += panDeltaY;
+                scale = newScale;
+
+                // Update state untuk frame selanjutnya
+                initialPinchDistance = newPinchDistance;
+                lastPanMidpoint = newMidpoint;
+            }
+        }
+        
+        function handleTouchEnd(e) {
+            isGesturing = false;
+            lastDrawnPixel = {x: null, y: null}; // Reset piksel terakhir saat jari diangkat
+        }
+
+        // --- Fungsi Bantuan untuk Gestur ---
+        function getPinchDistance(touches) {
+            const dx = touches[0].clientX - touches[1].clientX;
+            const dy = touches[0].clientY - touches[1].clientY;
+            return Math.sqrt(dx * dx + dy * dy);
+        }
+
+        function getMidpoint(touches) {
+            return {
+                x: (touches[0].clientX + touches[1].clientX) / 2,
+                y: (touches[0].clientY + touches[1].clientY) / 2
+            };
+        }
+
+        // --- Inisialisasi Aplikasi ---
+        
+        async function main() {
+            setupCanvas();
+            setupPalette();
+
+            // Event Listeners
+            canvas.addEventListener('touchstart', handleTouchStart);
+            canvas.addEventListener('touchmove', handleTouchMove);
+            canvas.addEventListener('touchend', handleTouchEnd);
+            
+            colorPicker.addEventListener('input', (e) => { currentColor = e.target.value; });
+            window.addEventListener('resize', () => { setupCanvas(); });
+            
+            // Autentikasi
+            try {
+                const token = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+                if (token) await signInWithCustomToken(auth, token);
+                else await signInAnonymously(auth);
+            } catch(e) {
+                console.error("Gagal autentikasi:", e);
+                loadingIndicator.textContent = "Gagal terhubung.";
+            }
+
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    const pixelCollectionRef = collection(db, PIXEL_COLLECTION);
+                    onSnapshot(pixelCollectionRef, (snapshot) => {
+                        snapshot.docChanges().forEach((change) => {
+                            const data = change.doc.data();
+                            pixels[change.doc.id] = data;
+                        });
+                        if (loadingIndicator) {
+                            loadingIndicator.style.display = 'none';
+                        }
+                    }, (error) => {
+                        console.error("Error saat sinkronisasi:", error);
+                        loadingIndicator.textContent = "Error sinkronisasi.";
+                    });
+                }
+            });
+            
+            function animationLoop() {
+              draw();
+              requestAnimationFrame(animationLoop);
+            }
+            animationLoop();
+        }
+
+        window.onload = main;
+    </script>
+</body>
+</html>
+
